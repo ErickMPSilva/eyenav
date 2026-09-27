@@ -3,7 +3,7 @@
 # Não é necessário alterar o restante do código para customizar o sistema.
 
 # Câmera
-WEBCAM_INDEX  = 0       # Índice da câmera (0 = padrão, 1 = segunda câmera)
+WEBCAM_INDEX  = 1       # Índice da câmera (0 = padrão, 1 = segunda câmera)
 WEBCAM_WIDTH  = 1280 
 WEBCAM_HEIGHT = 720
 TARGET_FPS    = 30
@@ -44,3 +44,14 @@ DWELL_RADIUS_PX = 60     # Raio de tolerância (pixels)
 SHOW_DEBUG_WINDOW  = True  # Janela OpenCV com feed da câmera e métricas
 DEBUG_WINDOW_SCALE = 0.55  # Escala da janela de debug
 CURSOR_MOVE        = True  # False = só debug, sem mover cursor do SO
+
+BLINK_CLICK_ENABLED      = True
+BLINK_EAR_THRESHOLD      = 0.12
+BLINK_MIN_MS             = 500
+BLINK_MAX_MS             = 800
+BLINK_RIGHT_MIN_MS       = 800
+BLINK_RIGHT_MAX_MS       = 1500
+BLINK_DOUBLE_INTERVAL_MS = 400
+SCROLL_ZONE_PX           = 80
+SCROLL_SPEED             = 3
+SCROLL_INTERVAL_MS       = 150

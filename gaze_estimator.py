@@ -184,8 +184,10 @@ class GazeEstimator:
         if eye_l_w > 1 and eye_l_h > 1:
             lnx = (iris_l[0] - eye_l_center[0]) / (eye_l_w / 2)
             lny = (iris_l[1] - eye_l_center[1]) / (eye_l_h / 2)
+            ear_l = eye_l_h / eye_l_w
         else:
             lnx, lny = 0.0, 0.0
+            ear_l = 0.3  
 
         # Olho direito
         iris_r      = px_fn(RIGHT_IRIS_CENTER)
@@ -201,8 +203,10 @@ class GazeEstimator:
         if eye_r_w > 1 and eye_r_h > 1:
             rnx = (iris_r[0] - eye_r_center[0]) / (eye_r_w / 2)
             rny = (iris_r[1] - eye_r_center[1]) / (eye_r_h / 2)
+            ear_r = eye_r_h / eye_r_w
         else:
             rnx, rny = 0.0, 0.0
+            ear_r = 0.3 
 
         gaze_x = (lnx + rnx) / 2
         gaze_y = (lny + rny) / 2
@@ -211,6 +215,7 @@ class GazeEstimator:
             'gaze_vector':     (gaze_x, gaze_y),
             'left_iris_norm':  (lnx, lny),
             'right_iris_norm': (rnx, rny),
+            'ear':             (ear_l + ear_r) / 2,
             'iris_left_px':    iris_l.astype(int),
             'iris_right_px':   iris_r.astype(int),
             'eye_l_center_px': eye_l_center.astype(int),
@@ -232,7 +237,8 @@ class GazeEstimator:
         cv2.circle(frame, tuple(feat['eye_r_center_px']), 3, (255, 100, 0), -1)
 
         gx, gy = feat['gaze_vector']
-        cv2.putText(frame, f'Gaze norm: ({gx:+.3f}, {gy:+.3f})', (10, 30),
+        ear    = feat.get('ear', 0)
+        cv2.putText(frame, f'Gaze: ({gx:+.3f}, {gy:+.3f})  EAR: {ear:.3f}', (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
         return frame
 
