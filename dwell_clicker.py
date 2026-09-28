@@ -12,7 +12,10 @@ Algoritmo:
   4. Se distância > DWELL_RADIUS_PX → reinicia âncora e temporizador.
   5. Se distância ≤ DWELL_RADIUS_PX e tempo ≥ DWELL_TIME_MS → clique.
   6. Após clicar, marca como 'clicado' para evitar disparo duplo.
-  7. Novo movimento além do raio reinicia o ciclo.
+  7. Só rearma quando o olhar se afasta mais que DWELL_REARM_PX
+     (maior que o raio), para que tremores não gerem cliques repetidos.
+
+A execução do clique é delegada ao mouse_backend.
 
 Referências:
   Sibert & Jacob (2000) — primeira avaliação sistemática de dwell time
@@ -20,102 +23,11 @@ Referências:
   Majaranta & Bulling (2014) — revisão de técnicas de seleção ocular.
 """
 
-import os
 import time
-import subprocess
-import threading
-from config import DWELL_TIME_MS, DWELL_RADIUS_PX
 
-# Detecção de ambiente e backend
+import mouse_backend
+from config import DWELL_TIME_MS, DWELL_RADIUS_PX, DWELL_REARM_PX
 
-_SESSION  = os.environ.get('XDG_SESSION_TYPE', 'x11').lower()
-_WAYLAND  = bool(os.environ.get('WAYLAND_DISPLAY'))
-_DISPLAY  = os.environ.get('DISPLAY', ':0')
-
-def _cmd_ok(cmd: str) -> bool:
-    """Verifica se um comando está disponível no sistema."""
-    try:
-        r = subprocess.run(['which', cmd],
-                           capture_output=True, timeout=2)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-_HAS_XDOTOOL = _cmd_ok('xdotool')
-_HAS_YDOTOOL = _cmd_ok('ydotool')
-
-try:
-    from pynput.mouse import Controller as _MC, Button as _Btn
-    _pynput_mouse = _MC()
-    _HAS_PYNPUT = True
-except Exception:
-    _pynput_mouse = None
-    _HAS_PYNPUT = False
-
-# Escolhe backend
-if _WAYLAND and _HAS_YDOTOOL:
-    _BACKEND = 'ydotool'
-elif _HAS_XDOTOOL:
-    _BACKEND = 'xdotool'
-elif _HAS_PYNPUT:
-    _BACKEND = 'pynput'
-else:
-    _BACKEND = 'none'
-
-print(f'[DwellClicker] Ambiente: {_SESSION}'
-      f'{"(Wayland)" if _WAYLAND else "(X11)"}')
-print(f'[DwellClicker] Backend de clique: {_BACKEND}')
-if _BACKEND == 'none':
-    print('[DwellClicker] AVISO: nenhum backend de clique disponível!')
-    print('  Instale xdotool:  sudo apt install xdotool')
-    print('  Ou ydotool (Wayland): sudo apt install ydotool')
-
-
-# Função de clique
-
-def _do_click(x: int, y: int):
-    """
-    Dispara clique esquerdo na posição (x, y).
-    Executado em thread separada para não bloquear o loop de frames.
-    """
-    def _click():
-        try:
-            if _BACKEND == 'xdotool':
-                # mousemove + click em um comando só
-                subprocess.run(
-                    ['xdotool', 'mousemove', '--sync',
-                     str(x), str(y), 'click', '--clearmodifiers', '1'],
-                    timeout=1, capture_output=True,
-                    env={**os.environ, 'DISPLAY': _DISPLAY}
-                )
-
-            elif _BACKEND == 'ydotool':
-                # ydotool para Wayland
-                subprocess.run(
-                    ['ydotool', 'mousemove', '--absolute',
-                     f'-x', str(x), f'-y', str(y)],
-                    timeout=1, capture_output=True
-                )
-                time.sleep(0.05)
-                subprocess.run(
-                    ['ydotool', 'click', '0x40001'],   # botão esquerdo
-                    timeout=1, capture_output=True
-                )
-
-            elif _BACKEND == 'pynput' and _pynput_mouse:
-                _pynput_mouse.position = (x, y)
-                time.sleep(0.02)
-                _pynput_mouse.press(_Btn.left)
-                time.sleep(0.02)
-                _pynput_mouse.release(_Btn.left)
-
-        except Exception as e:
-            print(f'[DwellClicker] Erro no clique: {e}')
-
-    threading.Thread(target=_click, daemon=True).start()
-
-
-# Classe principal
 
 class DwellClicker:
     """Gerencia a lógica de clique por fixação do olhar."""
@@ -139,11 +51,15 @@ class DwellClicker:
 
         dist = _dist(gx, gy, self._ax, self._ay)
 
-        if dist > DWELL_RADIUS_PX:
-            self._reset_anchor(gx, gy)
+        if self._fired:
+            # Após um clique, só rearma se o olhar realmente sair do alvo.
+            # Evita que tremores ou piscadas gerem cliques repetidos.
+            if dist > DWELL_REARM_PX:
+                self._reset_anchor(gx, gy)
             return False
 
-        if self._fired:
+        if dist > DWELL_RADIUS_PX:
+            self._reset_anchor(gx, gy)
             return False
 
         elapsed_ms = (time.time() - self._t_start) * 1000
@@ -151,8 +67,8 @@ class DwellClicker:
             ax, ay = int(self._ax), int(self._ay)
             self._click_count += 1
             print(f'[DwellClicker] CLIQUE #{self._click_count} '
-                  f'em ({ax}, {ay}) — backend: {_BACKEND}')
-            _do_click(ax, ay)
+                  f'em ({ax}, {ay}) — backend: {mouse_backend.BACKEND}')
+            mouse_backend.click(ax, ay)
             self._fired = True
             return True
 

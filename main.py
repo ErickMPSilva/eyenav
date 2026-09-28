@@ -13,17 +13,19 @@ Pipeline completo (por frame):
   ② Detecção de malha facial — MediaPipe Face Mesh
   ③ Extração da posição normalizada da íris + EAR (GazeEstimator)
   ④ Mapeamento gaze → tela — modelo polinomial (GazeModel)
-  ⑤ Suavização EMA do ponto de olhar (EMASmoother)
-  ⑥ Movimento do cursor do sistema (CursorController)
-  ⑦ Detecção e disparo de dwell click (DwellClicker)
-  ⑧ Detecção de piscada intencional (BlinkClicker)
-  ⑨ Scroll por borda da tela (EdgeScroller)
-  ⑩ Coleta de métricas (MetricsCollector)
+  ⑤ Suavização do olhar: mediana + filtro One Euro (GazeSmoother)
+  ⑥ Ganho + atração de borda (alcance dos cantos da tela)
+  ⑦ Movimento do cursor do sistema (CursorController)
+  ⑧ Detecção e disparo de dwell click (DwellClicker)
+  ⑨ Detecção de piscada intencional (BlinkClicker)
+  ⑩ Scroll por borda da tela (EdgeScroller)
+  ⑪ Coleta de métricas (MetricsCollector)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Controles (janela de debug):
   Q / ESC  → Encerrar
   R        → Recalibrar
+  F        → Refazer ajuste fino
   D        → Ativar / desativar dwell click
   B        → Ativar / desativar blink click
   M        → Salvar métricas da sessão em CSV
@@ -34,6 +36,7 @@ import sys
 import time
 import cv2
 import numpy as np
+import mouse_backend
 
 # Resolução da tela
 try:
@@ -47,14 +50,19 @@ except Exception:
 from config            import (WEBCAM_INDEX, WEBCAM_WIDTH, WEBCAM_HEIGHT,
                                 TARGET_FPS, CALIB_FILE,
                                 SHOW_DEBUG_WINDOW, DEBUG_WINDOW_SCALE,
-                                DWELL_RADIUS_PX, BLINK_CLICK_ENABLED)
+                                DWELL_TIME_MS, DWELL_RADIUS_PX,
+                                BLINK_CLICK_ENABLED, FINE_TUNE_ENABLED,
+                                CURSOR_GAIN_X, CURSOR_GAIN_Y, EDGE_SNAP_PX)
 from gaze_estimator    import GazeEstimator
 from gaze_model        import GazeModel
 from calibration       import CalibrationScreen
-from smoother          import EMASmoother
+from fine_tune         import FineTuneScreen
+from gaze_overlay      import GazeOverlay
+from smoother          import GazeSmoother
 from cursor_controller import CursorController
 from dwell_clicker     import DwellClicker
 from blink_clicker     import BlinkClicker
+from eye_state         import EyeState
 from edge_scroller     import EdgeScroller
 from metrics           import MetricsCollector
 
@@ -67,6 +75,35 @@ _WHITE  = (220, 220, 220)
 _GRAY   = (120, 120, 120)
 _YELLOW = (0, 200, 255)
 _ORANGE = (0, 165, 255)
+
+
+# Mapeamento final do cursor
+
+def _to_screen(x: float, y: float) -> tuple[int, int]:
+    """
+    Aplica ganho a partir do centro e atração de borda.
+
+    Ganho (CURSOR_GAIN_X/Y): compensa a leve compressão do modelo nas
+    extremidades, onde a estimativa da íris é menos precisa.
+    Atração de borda (EDGE_SNAP_PX): perto da borda, o cursor vai
+    exatamente até ela — necessário para alcançar cantos, barras
+    de rolagem e as zonas do edge scroll.
+    """
+    cx, cy = SCREEN_W / 2, SCREEN_H / 2
+    x = cx + (x - cx) * CURSOR_GAIN_X
+    y = cy + (y - cy) * CURSOR_GAIN_Y
+
+    if x < EDGE_SNAP_PX:
+        x = 0
+    elif x > SCREEN_W - 1 - EDGE_SNAP_PX:
+        x = SCREEN_W - 1
+    if y < EDGE_SNAP_PX:
+        y = 0
+    elif y > SCREEN_H - 1 - EDGE_SNAP_PX:
+        y = SCREEN_H - 1
+
+    return (int(max(0, min(x, SCREEN_W - 1))),
+            int(max(0, min(y, SCREEN_H - 1))))
 
 
 # Helpers de desenho
@@ -93,11 +130,11 @@ def _draw_scroll_zone(frame: np.ndarray, cam_h: int, cam_w: int,
     """Destaca visualmente a borda de scroll ativa."""
     if zone == 'top':
         cv2.rectangle(frame, (0, 0), (cam_w, 18), _ORANGE, -1)
-        cv2.putText(frame, '▲ SCROLL UP', (cam_w // 2 - 55, 14),
+        cv2.putText(frame, 'SCROLL UP', (cam_w // 2 - 45, 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
     elif zone == 'bottom':
         cv2.rectangle(frame, (0, cam_h - 18), (cam_w, cam_h), _ORANGE, -1)
-        cv2.putText(frame, '▼ SCROLL DOWN', (cam_w // 2 - 65, cam_h - 4),
+        cv2.putText(frame, 'SCROLL DOWN', (cam_w // 2 - 55, cam_h - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
 
@@ -113,18 +150,27 @@ def _draw_info_panel(frame: np.ndarray, lines: list[tuple[str, tuple]]):
 def main():
     _banner()
 
+    if not mouse_backend.available():
+        print('[ERRO] Nenhum backend de mouse disponível.')
+        print('       sudo apt install xdotool   ou   pip install pynput')
+        sys.exit(1)
+
     # Módulos
     estimator = GazeEstimator()
     model     = GazeModel(degree=2, alpha=1.0)
-    smoother  = EMASmoother()
+    smoother  = GazeSmoother()
     cursor    = CursorController(SCREEN_W, SCREEN_H)
     dwell     = DwellClicker()
     blink     = BlinkClicker() if BLINK_CLICK_ENABLED else None
     scroller  = EdgeScroller(screen_h=SCREEN_H)
+    eye_state = EyeState()
     metrics   = MetricsCollector()
 
     # Câmera
     cap = cv2.VideoCapture(WEBCAM_INDEX)
+    # MJPG: muitas webcams só entregam 720p/30fps nesse formato;
+    # em YUYV caem para 640×480, deixando o olho com ~30 px na imagem
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WEBCAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
@@ -137,10 +183,19 @@ def main():
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f'  Câmera aberta: {cam_w}×{cam_h} @ índice {WEBCAM_INDEX}')
+    if cam_w < WEBCAM_WIDTH:
+        print(f'  [AVISO] Resolução abaixo da pedida ({WEBCAM_WIDTH}×{WEBCAM_HEIGHT}). '
+              f'A precisão do olhar será menor.')
     print(f'  Tela:          {SCREEN_W}×{SCREEN_H}')
 
     # Calibração
     _run_calibration_if_needed(model, estimator, cap)
+
+    # Ajuste fino: viés + filtro calibrados para a sessão atual
+    bias = _fine_tune(model, estimator, cap, smoother)
+
+    # Bola vermelha no ponto de olhar
+    overlay = GazeOverlay()
 
     # Janela de debug
     debug_win = None
@@ -151,14 +206,9 @@ def main():
                          int(cam_w * DEBUG_WINDOW_SCALE),
                          int(cam_h * DEBUG_WINDOW_SCALE))
         cv2.setWindowProperty(debug_win, cv2.WND_PROP_TOPMOST, 1)
-        try:
-            from screeninfo import get_monitors
-            _m = get_monitors()[0]
-            _dw = int(cam_w * DEBUG_WINDOW_SCALE)
-            _dh = int(cam_h * DEBUG_WINDOW_SCALE)
-            cv2.moveWindow(debug_win, _m.width - _dw - 10, _m.height - _dh - 60)
-        except Exception:
-            cv2.moveWindow(debug_win, 10, 10)
+        _dw = int(cam_w * DEBUG_WINDOW_SCALE)
+        _dh = int(cam_h * DEBUG_WINDOW_SCALE)
+        cv2.moveWindow(debug_win, SCREEN_W - _dw - 10, SCREEN_H - _dh - 60)
 
     _print_controls()
 
@@ -193,36 +243,40 @@ def main():
         face_ok = feat is not None
 
         if face_ok and model.is_trained:
-            raw_x, raw_y = model.predict(feat['gaze_vector'])
-            sx, sy       = smoother.update(raw_x, raw_y)
-            gaze_sx      = int(max(0, min(sx, SCREEN_W - 1)))
-            gaze_sy      = int(max(0, min(sy, SCREEN_H - 1)))
+            ear = feat.get('ear', 0.3)
 
-            cursor.move(gaze_sx, gaze_sy)
+            # Piscada (natural ou intencional): a íris "salta" e o olhar
+            # estimado deixa de ser confiável → congela cursor, dwell e scroll
+            gaze_blocked = eye_state.update(ear)
 
-            # Dwell click
-            if dwell_on:
-                clicked = dwell.update(gaze_sx, gaze_sy)
-                if clicked:
-                    metrics.record_click(gaze_sx, gaze_sy, dwell_ms=1500)
-                    print(f'  [DWELL] ({gaze_sx}, {gaze_sy})')
+            if not gaze_blocked:
+                raw_x, raw_y     = model.predict(feat['features'])
+                raw_x, raw_y     = raw_x + bias[0], raw_y + bias[1]
+                sx, sy           = smoother.update(raw_x, raw_y)
+                gaze_sx, gaze_sy = _to_screen(sx, sy)
+                cursor.move(gaze_sx, gaze_sy)
+                overlay.move(gaze_sx, gaze_sy)
 
-            # Blink click
+            # Blink click (intencional, olhos fechados ≥ BLINK_MIN_MS)
+            blink_result = None
             if blink_on and blink:
-                ear = feat.get('ear', 0.3)
                 blink_result = blink.update(ear, gaze_sx, gaze_sy)
                 if blink_result:
                     metrics.record_click(gaze_sx, gaze_sy, dwell_ms=0)
-                    _TIPOS = {
-                        'single': 'CLIQUE SIMPLES  🖱',
-                        'double': 'DUPLO CLIQUE    🖱🖱',
-                        'right' : 'CLIQUE DIREITO  🖱▶',
-                    }
-                    print(f'  [BLINK] {_TIPOS.get(blink_result, blink_result)}'
-                        f'  @ ({gaze_sx}, {gaze_sy})')
+                    dwell.reset()          # evita dwell logo após a piscada
+                    print(f'  [BLINK] {blink_result}  @ ({gaze_sx}, {gaze_sy})')
 
-            # Edge scroll
-            scroller.update(gaze_sy)
+            if not gaze_blocked:
+                # Dwell click
+                if dwell_on and not blink_result:
+                    if dwell.update(gaze_sx, gaze_sy):
+                        ax, ay = dwell.anchor
+                        metrics.record_click(int(ax), int(ay),
+                                             dwell_ms=DWELL_TIME_MS)
+                        print(f'  [DWELL] ({int(ax)}, {int(ay)})')
+
+                # Edge scroll
+                scroller.update(gaze_sy)
 
         dt_ms = (time.time() - t0) * 1000
         metrics.record_frame(dt_ms)
@@ -236,10 +290,9 @@ def main():
 
             # Indicador de dwell
             if dwell_on and face_ok:
-                prog = dwell.progress
                 fx = int(gaze_sx * cam_w / SCREEN_W)
                 fy = int(gaze_sy * cam_h / SCREEN_H)
-                _draw_dwell_arc(dbg, fx, fy, prog)
+                _draw_dwell_arc(dbg, fx, fy, dwell.progress)
 
             # Indicador de zona de scroll
             _draw_scroll_zone(dbg, cam_h, cam_w, scroller.active_zone)
@@ -247,13 +300,13 @@ def main():
             # Painel de info
             ear          = feat.get('ear', 0.0) if face_ok else 0.0
             status_face  = 'Detectada' if face_ok else 'Ausente'
-            status_calib = 'Sim'       if model.is_trained else 'Não'
+            status_calib = 'Sim'       if model.is_trained else 'Nao'
             status_dwell = 'ON'        if dwell_on  else 'OFF'
             status_blink = 'ON'        if blink_on  else 'OFF'
             color_face   = _GREEN if face_ok else _RED
 
             info = [
-                (f'FPS: {fps_val:.1f}  |  Latência: {dt_ms:.1f} ms', _CYAN),
+                (f'FPS: {fps_val:.1f}  |  Latencia: {dt_ms:.1f} ms', _CYAN),
                 (f'Face: {status_face}', color_face),
                 (f'Calibrado: {status_calib}', _WHITE),
                 (f'Dwell: {status_dwell}  |  Blink: {status_blink}',
@@ -262,16 +315,14 @@ def main():
             ]
 
             if face_ok:
-                blink_state = ''
+                ear_txt = f'EAR: {ear:.3f}  limiar: {eye_state.threshold:.3f}'
+                if eye_state.blocked:
+                    ear_txt += '  [PISCADA - olhar ignorado]'
                 if blink_on and blink and blink.eye_closed:
-                    blink_state = '  [OLHO FECHADO]'
-                zone = scroller.active_zone
-                scroll_state = f'  ↑SCROLL' if zone == 'top' else \
-                               f'  ↓SCROLL' if zone == 'bottom' else ''
-                info.append((
-                    f'EAR: {ear:.3f}{blink_state}{scroll_state}',
-                    _ORANGE if (blink_state or scroll_state) else _YELLOW
-                ))
+                    ear_txt += '  [BLINK]'
+                info.append((ear_txt,
+                             _ORANGE if eye_state.blocked else _YELLOW))
+                info.append((f'Piscadas detectadas: {eye_state.blinks}', _GRAY))
 
             if dwell_on and face_ok:
                 info.append((f'Dwell: {dwell.progress*100:.0f}%', _YELLOW))
@@ -279,7 +330,7 @@ def main():
             _draw_info_panel(dbg, info)
 
             cv2.putText(dbg,
-                        'Q=Sair  R=Recalib  D=Dwell  B=Blink  M=Metricas  S=Screen',
+                        'Q=Sair  R=Recalib  F=Ajuste  D=Dwell  B=Blink  M=Metricas  S=Screen',
                         (6, cam_h - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, _GRAY, 1)
 
@@ -293,8 +344,16 @@ def main():
 
         elif key == ord('r'):
             print('\n  Iniciando recalibração...')
-            _do_recalibration(model, estimator, cap, smoother, dwell,
-                              blink, scroller)
+            overlay.hide()
+            if _do_recalibration(model, estimator, cap, smoother, dwell,
+                                 blink, scroller):
+                bias = _fine_tune(model, estimator, cap, smoother)
+
+        elif key == ord('f'):
+            print('\n  Refazendo ajuste fino...')
+            overlay.hide()
+            bias = _fine_tune(model, estimator, cap, smoother, bias)
+            dwell.reset()
 
         elif key == ord('d'):
             dwell_on = not dwell_on
@@ -308,8 +367,7 @@ def main():
                 print('  Blink click: ATIVADO')
             else:
                 blink_on = not blink_on
-                if not blink_on:
-                    blink.reset()
+                blink.reset()
                 print(f'  Blink click: {"ATIVADO" if blink_on else "DESATIVADO"}')
 
         elif key == ord('m'):
@@ -329,6 +387,7 @@ def main():
     metrics.save_csv()
     cap.release()
     cv2.destroyAllWindows()
+    overlay.close()
     estimator.close()
     if blink:
         blink.reset()
@@ -338,63 +397,72 @@ def main():
 
 # Funções auxiliares
 
+def _calibrate(model, estimator, cap) -> bool:
+    """Executa a tela de calibração, treina e salva o modelo."""
+    screen = CalibrationScreen(SCREEN_W, SCREEN_H)
+    features, targets = screen.run(estimator, cap)
+    if not features:
+        return False
+    model.train(features, targets)
+    model.save(CALIB_FILE)
+    print(f'  Calibração concluída com {len(features)} amostras.\n')
+    return True
+
+
 def _run_calibration_if_needed(model, estimator, cap):
     if model.load(CALIB_FILE):
         resp = input('\n  Calibração encontrada. Deseja recalibrar? (s/N): ')
         if resp.strip().lower() != 's':
             return
 
-    print('\n┌────────────────────────────────────────────┐')
+    print()
+    print('  ┌────────────────────────────────────────────┐')
     print('  │  CALIBRAÇÃO                                │')
+    print('  │  Mova apenas os olhos, não a cabeça.       │')
     print('  │  Fixe o olhar em cada círculo até          │')
-    print('  │  o arco completar (≈ 1,5 s por ponto).     │')
+    print('  │  o arco completar.                         │')
     print('  │  ESC = cancelar                            │')
     print('  └────────────────────────────────────────────┘')
     input('  Pressione ENTER para iniciar...')
 
-    from screeninfo import get_monitors
-    try:
-        m = get_monitors()[0]
-        sw, sh = m.width, m.height
-    except Exception:
-        sw, sh = 1920, 1080
-
-    screen = CalibrationScreen(sw, sh)
-    features, targets = screen.run(estimator, cap)
-
-    if not features:
+    if not _calibrate(model, estimator, cap):
         print('  [AVISO] Calibração cancelada ou incompleta.')
-        return
-
-    model.train(features, targets)
-    model.save(CALIB_FILE)
-    print(f'  Calibração concluída com {len(features)} pontos.\n')
 
 
 def _do_recalibration(model, estimator, cap, smoother, dwell,
-                      blink=None, scroller=None):
-    from screeninfo import get_monitors
-    try:
-        m = get_monitors()[0]
-        sw, sh = m.width, m.height
-    except Exception:
-        sw, sh = 1920, 1080
-
-    screen = CalibrationScreen(sw, sh)
-    features, targets = screen.run(estimator, cap)
-
-    if features:
-        model.train(features, targets)
-        model.save(CALIB_FILE)
+                      blink=None, scroller=None) -> bool:
+    if _calibrate(model, estimator, cap):
         smoother.reset()
         dwell.reset()
         if blink:
             blink.reset()
         if scroller:
             scroller.reset()
-        print(f'  Recalibração concluída ({len(features)} pontos).\n')
-    else:
-        print('  Recalibração cancelada.\n')
+        return True
+    print('  Recalibração cancelada.\n')
+    return False
+
+
+def _fine_tune(model, estimator, cap, smoother,
+               current_bias=(0.0, 0.0)) -> tuple[float, float]:
+    """
+    Executa o ajuste fino (triângulo) e aplica o resultado:
+    ajusta o filtro e retorna o viés (x, y) a somar às previsões.
+    Se cancelado, mantém o viés atual.
+    """
+    if not (FINE_TUNE_ENABLED and model.is_trained):
+        return current_bias
+
+    print('\n  Ajuste fino: fixe o olhar em cada ponto até ele desaparecer.')
+    res = FineTuneScreen(SCREEN_W, SCREEN_H).run(model, estimator, cap)
+    if res is None:
+        print('  Ajuste fino ignorado.\n')
+        return current_bias
+
+    smoother.set_min_cutoff(res.min_cutoff)
+    smoother.reset()
+    print()
+    return (res.bias_x, res.bias_y)
 
 
 def _banner():
@@ -413,6 +481,7 @@ def _print_controls():
     print('  │  SISTEMA ATIVO – Controles na janela de debug:     │')
     print('  │   Q / ESC → Encerrar                               │')
     print('  │   R       → Recalibrar                             │')
+    print('  │   F       → Refazer ajuste fino (3 pontos)         │')
     print('  │   D       → Ativar / desativar dwell click         │')
     print('  │   B       → Ativar / desativar blink click         │')
     print('  │   M       → Exibir e salvar métricas (CSV)         │')

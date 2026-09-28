@@ -4,9 +4,15 @@ Modelo de calibração: gaze vector → coordenadas de tela.
 Abordagem: Regressão Polinomial de grau 2 com regularização Ridge,
 separada para os eixos X e Y da tela.
 
-Features de entrada  : [gaze_x, gaze_y]
-Features expandidas  : [1, gx, gy, gx², gy², gx·gy]
+Features de entrada  : [lnx, lny, rnx, rny, l_lid, r_lid]  (ver gaze_estimator)
+Pré-processamento    : padronização (StandardScaler) — média 0, desvio 1
+Features expandidas  : polinômio de grau 2 (termos, quadrados e produtos)
 Targets              : screen_x  /  screen_y
+
+A padronização é necessária porque o vetor de olhar varia pouco
+(tipicamente ±0,1 a ±0,2). Sem ela, a penalidade L2 do Ridge atua
+sobre coeficientes da ordem de milhares e "encolhe" as previsões
+para o centro da tela.
 
 Esta abordagem é standard na literatura de low-cost eye tracking
 (Munn et al., 2008; Zhu & Ji, 2005) e lida melhor com não-linearidades
@@ -18,10 +24,10 @@ entre sessões sem precisar recalibrar toda vez.
 
 import pickle
 import numpy as np
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
-from config import CALIB_FILE
+from config import CALIB_FILE, FEATURE_VERSION
 
 
 class GazeModel:
@@ -75,14 +81,25 @@ class GazeModel:
         self._model_y.fit(X, y[:, 1])
         self.is_trained = True
 
-    def predict(self, gaze_vector: tuple) -> tuple[int, int]:
+        # Diagnóstico: erro nos próprios pontos de calibração
+        pred_x = self._model_x.predict(X)
+        pred_y = self._model_y.predict(X)
+        erros  = np.hypot(pred_x - y[:, 0], pred_y - y[:, 1])
+        print(f'[GazeModel] Erro nos pontos de calibração: '
+              f'média {erros.mean():.0f} px | máx {erros.max():.0f} px')
+        print(f'[GazeModel] Faixa da íris (olho esq.): '
+              f'x [{X[:, 0].min():+.3f}, {X[:, 0].max():+.3f}]  '
+              f'y [{X[:, 1].min():+.3f}, {X[:, 1].max():+.3f}]')
+        if X.shape[1] >= 6:
+            print(f'[GazeModel] Faixa da pálpebra (esq.): '
+                  f'[{X[:, 4].min():+.3f}, {X[:, 4].max():+.3f}]')
+        print(f'[GazeModel] Faixa prevista na tela: '
+              f'x [{pred_x.min():.0f}, {pred_x.max():.0f}]  '
+              f'y [{pred_y.min():.0f}, {pred_y.max():.0f}]')
+
+    def predict(self, features) -> tuple[int, int]:
         """
         Prediz a posição na tela a partir do vetor de olhar.
-
-        Parameters
-        ----------
-        gaze_vector : (float, float)
-            Posição normalizada da íris.
 
         Returns
         -------
@@ -91,7 +108,7 @@ class GazeModel:
         if not self.is_trained:
             raise RuntimeError('Modelo não treinado. Execute a calibração.')
 
-        X = np.array([[gaze_vector[0], gaze_vector[1]]], dtype=float)
+        X = np.asarray(features, dtype=float).reshape(1, -1)
         sx = int(round(self._model_x.predict(X)[0]))
         sy = int(round(self._model_y.predict(X)[0]))
         return sx, sy
@@ -103,6 +120,7 @@ class GazeModel:
             'model_y':  self._model_y,
             'degree':   self._degree,
             'trained':  self.is_trained,
+            'version':  FEATURE_VERSION,
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
@@ -119,6 +137,10 @@ class GazeModel:
         try:
             with open(path, 'rb') as f:
                 data = pickle.load(f)
+            if data.get('version') != FEATURE_VERSION:
+                print('[GazeModel] Calibração salva usa features antigas — '
+                      'será necessário recalibrar.')
+                return False
             self._model_x   = data['model_x']
             self._model_y   = data['model_y']
             self._degree    = data['degree']
@@ -132,6 +154,7 @@ class GazeModel:
 
     def _make_pipeline(self) -> Pipeline:
         return Pipeline([
-            ('poly',  PolynomialFeatures(degree=self._degree, include_bias=True)),
+            ('scale', StandardScaler()),
+            ('poly',  PolynomialFeatures(degree=self._degree, include_bias=False)),
             ('ridge', Ridge(alpha=self._alpha)),
         ])
